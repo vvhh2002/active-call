@@ -3,7 +3,6 @@ use rsip::{Response, StatusCodeKind};
 use rsipstack::{
     dialog::{authenticate::Credential, registration::Registration},
     rsip_ext::RsipResponseExt,
-    transaction::endpoint::EndpointInnerRef,
 };
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
@@ -44,7 +43,7 @@ impl RegisterOption {
 }
 
 pub struct RegistrationHandleInner {
-    pub endpoint_inner: EndpointInnerRef,
+    pub registration: Mutex<Registration>,
     pub option: RegisterOption,
     pub cancel_token: CancellationToken,
     pub start_time: Mutex<Instant>,
@@ -62,10 +61,7 @@ impl RegistrationHandle {
     }
 
     pub async fn do_register(&self, sip_server: &rsip::Uri, expires: Option<u32>) -> Result<u32> {
-        let mut registration = Registration::new(
-            self.inner.endpoint_inner.clone(),
-            self.inner.option.credential.clone().map(|c| c.into()),
-        );
+        let mut registration = self.inner.registration.lock().await;
         let resp = match registration
             .register(sip_server.clone(), expires)
             .await

@@ -27,6 +27,27 @@ pub async fn index() -> impl IntoResponse {
     }
 }
 
+enum ShutdownSignal {
+    CtrlC,
+    SigTerm,
+}
+
+async fn shutdown_signal() -> Result<ShutdownSignal> {
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    #[cfg(not(unix))]
+    let mut sigterm = std::future::pending::<()>();
+
+    tokio::select! {
+        result = signal::ctrl_c() => {
+            result?;
+            Ok(ShutdownSignal::CtrlC)
+        }
+        _ = sigterm.recv() => Ok(ShutdownSignal::SigTerm),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
@@ -272,10 +293,7 @@ async fn main() -> Result<()> {
         };
         let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         socket.set_reuse_address(true)?;
-        #[cfg(all(
-            unix,
-            not(any(target_os = "solaris", target_os = "illumos"))
-        ))]
+        #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
         socket.set_reuse_port(true)?;
         socket.bind(&addr.into())?;
         socket.listen(1024)?;
@@ -300,16 +318,16 @@ async fn main() -> Result<()> {
     let app_state_serving = app_state_clone.serve();
     let mut canceled = false;
     let cancel_timeout = future::pending().boxed();
+    let shutdown_task = future::pending::<anyhow::Result<()>>().boxed();
+    let shutdown_signal = shutdown_signal().boxed();
 
     tokio::pin!(axum_serving);
     tokio::pin!(app_state_serving);
     tokio::pin!(cancel_timeout);
-
-    #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::pin!(shutdown_task);
+    tokio::pin!(shutdown_signal);
 
     loop {
-        #[cfg(unix)]
         tokio::select! {
             result = &mut axum_serving => {
                 if let Err(e) = result {
@@ -323,50 +341,24 @@ async fn main() -> Result<()> {
                 }
                 break;
             }
-            _ = signal::ctrl_c(), if !canceled => {
-                info!("SIGINT (Ctrl-C) received");
-                if graceful_shutdown {
-                    app_state.stop();
-                    *cancel_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(30)).boxed();
-                    canceled = true;
-                } else {
-                    break;
-                }
-            }
-            _ = sigterm.recv(), if !canceled => {
-                info!("SIGTERM received");
-                if graceful_shutdown {
-                    app_state.stop();
-                    *cancel_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(30)).boxed();
-                    canceled = true;
-                } else {
-                    break;
-                }
-            }
-            _ = &mut cancel_timeout => {
-                warn!("Shutdown timeout reached, forcing exit");
-                break;
-            }
-        }
-
-        #[cfg(not(unix))]
-        tokio::select! {
-            result = &mut axum_serving => {
-                if let Err(e) = result {
-                    warn!("axum serve error: {:?}", e);
-                }
-                break;
-            }
-            res = &mut app_state_serving => {
+            res = &mut shutdown_task, if canceled => {
                 if let Err(e) = res {
-                    warn!("AppState server error: {}", e);
-                }
-                break;
-            }
-            _ = signal::ctrl_c(), if !canceled => {
-                info!("SIGINT (Ctrl-C) received");
-                if graceful_shutdown {
+                    warn!("Graceful AppState shutdown failed: {}", e);
                     app_state.stop();
+                }
+            }
+            signal = &mut shutdown_signal, if !canceled => {
+                match signal {
+                    Ok(ShutdownSignal::CtrlC) => info!("SIGINT (Ctrl-C) received"),
+                    Ok(ShutdownSignal::SigTerm) => info!("SIGTERM received"),
+                    Err(e) => {
+                        warn!("Shutdown signal handler failed: {}", e);
+                        break;
+                    }
+                }
+                if graceful_shutdown {
+                    let app_state = app_state.clone();
+                    shutdown_task.set(async move { app_state.graceful_stop().await }.boxed());
                     *cancel_timeout = tokio::time::sleep(tokio::time::Duration::from_secs(30)).boxed();
                     canceled = true;
                 } else {

@@ -185,7 +185,7 @@ impl AppStateInner {
         let timeout = self
             .config
             .graceful_shutdown
-            .map(|_| Duration::from_secs(50));
+            .map(|_| Duration::from_secs(10));
 
         match self.stop_registration(timeout).await {
             Ok(_) => {
@@ -424,9 +424,27 @@ impl AppStateInner {
     }
 
     pub fn stop(&self) {
+        if self.shutting_down.swap(true, Ordering::Relaxed) {
+            return;
+        }
         info!("stopping, marking as shutting down");
-        self.shutting_down.store(true, Ordering::Relaxed);
         self.token.cancel();
+    }
+    
+    pub async fn graceful_stop(&self) -> Result<()> {
+        if self.shutting_down.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
+        
+        info!("graceful stopping, marking as shutting down");
+        let timeout = self
+            .config
+            .graceful_shutdown
+            .map(|_| Duration::from_secs(10));
+
+        self.stop_registration(timeout).await?;
+        self.token.cancel();
+        Ok(())
     }
 
     pub async fn start_registration(&self) -> Result<usize> {
@@ -607,9 +625,14 @@ impl AppStateInner {
             }
         };
         let cancel_token = self.token.child_token();
+        let credential = option.credential.clone().map(|c| c.into());
+        let registration = rsipstack::dialog::registration::Registration::new(
+            self.endpoint.inner.clone(),
+            credential,
+        );
         let handle = RegistrationHandle {
             inner: Arc::new(crate::useragent::registration::RegistrationHandleInner {
-                endpoint_inner: self.endpoint.inner.clone(),
+                registration: Mutex::new(registration),
                 option,
                 cancel_token,
                 start_time: Mutex::new(std::time::Instant::now()),
