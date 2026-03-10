@@ -177,6 +177,7 @@ pub struct Config {
     pub http_addr: String,
     pub addr: String,
     pub udp_port: u16,
+    pub auto_learn_public_address: Option<bool>,
 
     pub log_level: Option<String>,
     pub log_file: Option<String>,
@@ -299,6 +300,7 @@ impl Default for Config {
             http_access_skip_paths: Vec::new(),
             addr: default_sip_addr(),
             udp_port: default_sip_port(),
+            auto_learn_public_address: None,
             useragent: None,
             register_users: None,
             graceful_shutdown: Some(true),

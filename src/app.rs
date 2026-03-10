@@ -11,6 +11,9 @@ use crate::{
             FnCreateInvitationHandler, PendingDialog, PendingDialogGuard,
             default_create_invite_handler,
         },
+        public_address::{
+            LearnedPublicAddresses, LearningMessageInspector, build_public_contact_uri,
+        },
         registration::{RegistrationHandle, UserCredential},
     },
 };
@@ -52,6 +55,7 @@ pub struct AppStateInner {
     pub invitation: Invitation,
     pub routing_state: Arc<crate::call::RoutingState>,
     pub pending_playbooks: Arc<Mutex<HashMap<String, (String, std::time::Instant)>>>,
+    pub learned_public_addresses: LearnedPublicAddresses,
 
     pub active_calls: Arc<std::sync::Mutex<HashMap<String, ActiveCallRef>>>,
     pub total_calls: AtomicU64,
@@ -77,6 +81,10 @@ pub struct AppStateBuilder {
 }
 
 impl AppStateInner {
+    pub fn auto_learn_public_address_enabled(&self) -> bool {
+        self.config.auto_learn_public_address.unwrap_or(false)
+    }
+
     pub fn get_dump_events_file(&self, session_id: &String) -> String {
         let recorder_root = self.config.recorder_path();
         let root = Path::new(&recorder_root);
@@ -294,17 +302,22 @@ impl AppStateInner {
                             continue;
                         }
                     };
-                    let contact = dialog_layer
-                        .endpoint
-                        .get_addrs()
-                        .first()
-                        .map(|addr| rsip::Uri {
-                            scheme: Some(rsip::Scheme::Sip),
-                            auth: None,
-                            host_with_port: addr.addr.clone(),
-                            params: vec![],
-                            headers: vec![],
-                        });
+                    let local_addr = tx
+                        .connection
+                        .as_ref()
+                        .map(|connection| connection.get_addr().clone())
+                        .or_else(|| dialog_layer.endpoint.get_addrs().first().cloned());
+                    let contact_username =
+                        tx.original.uri.auth.as_ref().map(|auth| auth.user.as_str());
+                    let contact = local_addr.as_ref().map(|addr| {
+                        build_public_contact_uri(
+                            &self.learned_public_addresses,
+                            self.auto_learn_public_address_enabled(),
+                            addr,
+                            contact_username,
+                            None,
+                        )
+                    });
 
                     let dialog = match dialog_layer.get_or_create_server_invite(
                         &tx,
@@ -734,6 +747,7 @@ impl AppStateBuilder {
             .cancel_token
             .unwrap_or_else(|| CancellationToken::new());
         let _ = set_cache_dir(&config.media_cache_path);
+        let learned_public_addresses = LearnedPublicAddresses::default();
 
         let local_ip = if !config.addr.is_empty() {
             std::net::IpAddr::from_str(config.addr.as_str())?
@@ -866,7 +880,13 @@ impl AppStateBuilder {
             .with_transport_layer(transport_layer)
             .with_option(endpoint_option);
 
-        if let Some(inspector) = self.message_inspector {
+        if config.auto_learn_public_address.unwrap_or(false) {
+            endpoint_builder =
+                endpoint_builder.with_inspector(Box::new(LearningMessageInspector::new(
+                    learned_public_addresses.clone(),
+                    self.message_inspector,
+                )));
+        } else if let Some(inspector) = self.message_inspector {
             endpoint_builder = endpoint_builder.with_inspector(inspector);
         }
 
@@ -929,6 +949,7 @@ impl AppStateBuilder {
             invitation: Invitation::new(dialog_layer),
             routing_state: Arc::new(crate::call::RoutingState::new()),
             pending_playbooks: Arc::new(Mutex::new(HashMap::new())),
+            learned_public_addresses,
             active_calls: Arc::new(std::sync::Mutex::new(HashMap::new())),
             total_calls: AtomicU64::new(0),
             total_failed_calls: AtomicU64::new(0),

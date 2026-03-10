@@ -29,7 +29,10 @@ use crate::{
         sip::{DialogStateReceiverGuard, Invitation, InviteDialogStates},
     },
     callrecord::{CallRecord, CallRecordEvent, CallRecordEventType, CallRecordHangupReason},
-    useragent::invitation::PendingDialog,
+    useragent::{
+        invitation::PendingDialog,
+        public_address::{build_public_contact_uri, contact_needs_public_resolution},
+    },
 };
 use anyhow::Result;
 use audio_codec::CodecType;
@@ -2035,22 +2038,29 @@ impl ActiveCall {
 
         // Set contact to local SIP endpoint address if not already set explicitly
         // Check if contact is still default (no scheme set) or if host is localhost-like
-        let needs_contact = invite_option.contact.scheme.is_none()
-            || invite_option
-                .contact
-                .host_with_port
-                .to_string()
-                .starts_with("127.0.0.1");
+        let needs_contact = contact_needs_public_resolution(&invite_option.contact);
 
         if needs_contact {
             if let Some(addr) = self.invitation.dialog_layer.endpoint.get_addrs().first() {
-                invite_option.contact = rsip::Uri {
-                    scheme: Some(rsip::Scheme::Sip),
-                    auth: None,
-                    host_with_port: addr.addr.clone(),
-                    params: vec![],
-                    headers: vec![],
-                };
+                let contact_username = invite_option
+                    .contact
+                    .auth
+                    .as_ref()
+                    .map(|auth| auth.user.as_str())
+                    .or_else(|| {
+                        invite_option
+                            .caller
+                            .auth
+                            .as_ref()
+                            .map(|auth| auth.user.as_str())
+                    });
+                invite_option.contact = build_public_contact_uri(
+                    &self.app_state.learned_public_addresses,
+                    self.app_state.auto_learn_public_address_enabled(),
+                    addr,
+                    contact_username,
+                    Some(&invite_option.contact),
+                );
             }
         }
 
