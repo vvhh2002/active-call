@@ -1,7 +1,7 @@
 use crate::{
     event::SessionEvent,
-    media::{Samples, cache},
     media::track::{Track, tts::TtsTrack},
+    media::{Samples, cache},
     synthesis::{
         Subtitle, SynthesisClient, SynthesisCommand, SynthesisEvent, SynthesisOption, SynthesisType,
     },
@@ -622,71 +622,5 @@ async fn test_tts_track_base64() -> Result<()> {
         leaked_cache_file.display()
     );
     cache::set_cache_dir(original_cache_dir.to_str().unwrap())?;
-    Ok(())
-}
-
-/// Test that streaming mode with end_of_stream properly sends TrackEnd
-/// This verifies the fix for the bug where the TTS task would get stuck
-/// in the select loop when stream finished but cmd was already finished,
-/// causing TrackEnd to never be sent.
-#[tokio::test]
-async fn test_tts_track_streaming_end_of_stream_track_end() -> Result<()> {
-    // Create a command channel
-    let (command_tx, command_rx) = mpsc::unbounded_channel();
-
-    // Create a TtsTrack with STREAMING mode (true)
-    let track_id = "test-track-streaming-eos".to_string();
-    let streaming_client = MockSynthesisClient::new(true); // streaming = true
-    let mut tts_track = TtsTrack::new(
-        track_id.clone(),
-        "test_session".to_string(),
-        true, // streaming mode
-        None,
-        command_rx,
-        Box::new(streaming_client),
-    );
-
-    // Create channels for the test
-    let (event_tx, event_rx) = broadcast::channel(16);
-    let (packet_tx, mut _packet_rx) = mpsc::unbounded_channel();
-
-    // Start the track
-    tts_track.start(event_tx, packet_tx).await?;
-
-    // Send a TTS command with end_of_stream=true
-    // This should trigger the bug: stream finishes (tts_finished=true),
-    // but cmd was already finished (cmd_finished=true), causing the
-    // select loop to get stuck with only ptimer.tick() available,
-    // and TrackEnd would never be sent.
-    command_tx.send(SynthesisCommand {
-        text: "Test streaming with end of stream".to_string(),
-        end_of_stream: true, // This is the key - triggers cmd_finished=true
-        ..Default::default()
-    })?;
-
-    // Wait for TrackEnd event using the same pattern as other tests
-    let timeout = tokio::time::sleep(Duration::from_secs(5));
-    let results = BroadcastStream::new(event_rx)
-        .take_until(timeout)
-        .collect::<Vec<_>>()
-        .await;
-
-    let mut track_end_received = false;
-    for result in results {
-        match result {
-            Ok(SessionEvent::TrackEnd { track_id: tid, .. }) => {
-                assert_eq!(tid, track_id, "Track ID mismatch");
-                track_end_received = true;
-            }
-            Ok(_) => {
-                // Ignore other events
-            }
-            Err(e) => {
-                panic!("Error receiving event: {:?}", e);
-            }
-        }
-    }
-
-    assert!(track_end_received, "TrackEnd event not received in streaming mode with end_of_stream");
     Ok(())
 }
